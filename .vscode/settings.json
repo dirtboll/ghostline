@@ -1,7 +1,5 @@
 {
-  "nim.projectMapping": [{
-      // everything else - use main.nim as root.
-      "projectFile": "src/ghostline.nim",
-      "fileRegex": ".*\\.nim"
-  }]
+  "nim.project": [
+    "src/ghostline.nim"
+  ]
 }

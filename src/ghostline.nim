@@ -1,118 +1,79 @@
-import chronos
-import std/[os, strformat, strutils]
-
+import tui_widget
 import libp2p
-import libp2p/protocols/pubsub/rpc/messages
-import libp2p/protocols/rendezvous
-import libp2p/discovery/rendezvousinterface
-import libp2p/discovery/discoverymngr
+import chronicles
+import chronicles/options as chronicles_options
+import strutils, os
+import ./[backend, frontend]
+import ./types/[channels, user]
 
-import ./chat, ./utils
+if paramCount() < 1:
+  when defined(chronicles_sinks):
+    if chronicles_sinks.contains("dynamic"):
+      defaultChroniclesStream.output.writer =
+        proc (logLevel: LogLevel, msg: LogOutputStr) {.gcsafe.} =
+          echo msg
+  startBootstrap()
+  quit()
 
-const 
-  AppNamespace = "stargate"
-  AppTopic = "chat"
+if paramCount() != 2:
+  stderr.writeLine("Please specify username and bootstrap address")
+  quit(1)
 
-proc createSwitch(rdv: RendezVous = RendezVous.new()): Switch =
-  SwitchBuilder
-    .new()
-    .withRng(newRng())
-    .withAddresses(@[MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet()])
-    .withTcpTransport()
-    .withYamux()
-    .withNoise()
-    .withRendezVous(rdv)
-    .build()
-
-proc inputLoop(gossip: GossipSub, username: string) {.async.} =
-  var inp: string
-  while true:
-    inp = await stdin.readLineAsync()
-    inp = inp.strip()
-    case inp:
-      of "/exit":
-        break
-      of "":
-        continue
-      else:
-        let chat = Chat.new(username, inp)
-        discard gossip.publish(AppTopic, encode(chat).buffer)
-
-    stdout.write("> ")
-
-proc main() {.async.} = 
-  if paramCount() < 1:
-    echo "Running as bootstrap node"
-    let bootNode = createSwitch()
-    await bootNode.start()
-    for add in bootNode.peerInfo.fullAddrs().tryGet():
-      echo  "address: " & $add
-    while true:
-      await sleepAsync(1.seconds)
-
-  # Parse params
-  if paramCount() != 2:
-    stderr.writeLine("Please specify username and bootstrap address")
-    quit(1)
-
-  let username = paramStr(1)
-  let param = paramStr(2)
-  let peerAddrRes = parseFullAddress(param)
-  if peerAddrRes.isErr:
-    stderr.writeLine("bootstrap node address invalid: " & peerAddrRes.error())
-    quit(1)
-  let (peerId, peerAddr) = peerAddrRes.tryGet()
-
-  # Create switch with Rendezveus peer discovery
-  let 
-    rdv = RendezVous.new()
-    switch = createSwitch(rdv)
-    dm = DiscoveryManager()
-  dm.add(RendezVousInterface.new(rdv, ttr = 250.milliseconds))
-
-  # Use GossipSub 
-  var gossip = GossipSub.init(switch = switch, triggerSelf = true)
-  switch.mount(gossip)
-  gossip.addValidator(
-    [AppTopic],
-    proc(topic: string, message: Message): Future[ValidationResult] {.async.} =
-      let decoded = Chat.decode(message.data)
-      if decoded.isErr:
-        echo "decode reject"
-        return ValidationResult.Reject
-      echo "decode accept"
-      return ValidationResult.Accept
-  )
-  gossip.subscribe(
-    AppTopic,
-    proc(_: string, data: seq[byte]) {.async.} =
-      let 
-        chat = Chat.decode(data).tryGet()
-        timestamp = chat.timestamp
-        user = chat.user
-        message = chat.message
-      echo &"[{timestamp}] {user}: {message}"
+let 
+  username = paramStr(1)
+  param = paramStr(2)
+  peerAddrRes = parseFullAddress(param)
+if peerAddrRes.isErr:
+  stderr.writeLine("bootstrap node address invalid: " & peerAddrRes.error())
+  quit(1)
+let 
+  (bootstrapPeerId, bootstrapPeerAddr) = peerAddrRes.tryGet()
+  initUser = InitUser(
+    username: username,
+    bootstrapPeerId: bootstrapPeerId,
+    bootstrapPeerAddr: bootstrapPeerAddr
   )
 
-  # Start switch and connect to bootstrap
-  await switch.start()
-  await switch.connect(peerId, @[peerAddr])
+var 
+  backendChan: Channel[ChannelMsg]
+  frontendChan: Channel[ChannelMsg]
+  backendThread: Thread[tuple[backend, frontend: ptr Channel[ChannelMsg], initUser: InitUser]]
+  frontendThread: Thread[tuple[backend, frontend: ptr Channel[ChannelMsg], termApp: ptr TerminalApp]]
+  termDisplay = newDisplay(1, 1, consoleWidth(), consoleHeight()-3, id="chat", title="message")
+  termInput = newInputBox(1, consoleHeight()-2, consoleWidth(), consoleHeight(), title="chat")
+  termApp = newTerminalApp(title="Ghostline", border=false)
 
-  # Advertise self and connect with others
-  dm.advertise(RdvNamespace(AppNamespace))
-  let peerQuery = dm.request(RdvNamespace(AppNamespace))
-  peerQuery.forEach:
-    echo "Got peer: " & $(peer[PeerId]) & " | " & $(peer.getAll(MultiAddress))
-    if peer[PeerId] != switch.peerInfo.peerId:
-      await switch.connect(peer[PeerId], peer.getAll(MultiAddress))
+when defined(chronicles_sinks):
+  if chronicles_sinks.contains("dynamic"):
+    defaultChroniclesStream.output.writer =
+      proc (logLevel: LogLevel, msg: LogOutputStr) {.gcsafe.} =
+        frontendChan.send(ChannelMsg.new(ChannelMsgKind.cmkFeMsg, msg))
 
-  # Wait for ctrl+c
-  await inputLoop(gossip, username)
+backendChan.open()
+frontendChan.open()
+createThread(backendThread, startBackend, (addr backendChan, addr frontendChan, initUser))
+createThread(frontendThread, startFrontend, (addr backendChan, addr frontendChan, addr termApp))
 
-  # Clean up
-  peerQuery.stop()
-  dm.stop()
-  await allFutures(switch.stop())
-  
+termDisplay.on("display", proc(dp: Display, args: varargs[string]) =
+  dp.text = args[0]
+)
 
-waitFor(main())
+let termInputOnEnter = proc(ib: InputBox, arg: varargs[string]) =
+  let cmd = termInput.value.split(" ")
+  if cmd.len < 1:
+    return
+  case cmd[0]:
+  of "/connect":
+    backendChan.send(ChannelMsg.new(ChannelMsgKind.cmkSwitchConnect, cmd[1]))
+  of "/username":
+    backendChan.send(ChannelMsg.new(ChannelMsgKind.cmkChangeUsername, cmd[1]))
+  else:
+    backendChan.send(ChannelMsg.new(ChannelMsgKind.cmkChat, termInput.value))
+  termInput.value("")
+termInput.onEnter = termInputOnEnter
+termInput.focus = true
+termApp.addWidget(termInput)
+termApp.addWidget(termDisplay)
+# TODO: attach ctrl+c hook for graceful shutdown
+termApp.run(nonBlocking = true)
+
